@@ -450,10 +450,23 @@ pub(crate) fn sync_with_cache(
         first = height;
         last = Some(block);
     }
+    let mut pir_report = None;
+    if let Some(pir_url) = &config.pir_url {
+        let pir = crate::pir::PirClient::new(pir_url, config.pir_ca_file.as_deref(), control)?;
+        pir_report = Some(pir.sync_pir(store, config, &rpc)?);
+    }
     let last = last.expect("checkpoint was retained or reloaded");
     let mut needed_start = first;
     if let Some(height) = from_height {
         ensure!(height <= tip, "search height is above the node tip");
+        needed_start = needed_start.min(epoch_start(height, config.activation)?);
+    }
+    if let Some(height) = pir_report
+        .as_ref()
+        .and_then(|r| r.earliest_discovered_height)
+        && height >= config.activation
+        && height <= tip
+    {
         needed_start = needed_start.min(epoch_start(height, config.activation)?);
     }
     // Full blocks that hold receipts, from the node.
@@ -631,7 +644,8 @@ pub(crate) fn sync_with_cache(
         "birthday_height":config.birthday_height.unwrap_or(config.activation),
         "sync_start_height":if backfill { needed_start } else { first },
         "unresolved_receipts":unresolved,
-        "transparent_synced_height":store.funding_snapshot()?.map(|snapshot| snapshot.height)}),
+        "transparent_synced_height":store.funding_snapshot()?.map(|snapshot| snapshot.height),
+        "pir":pir_report}),
     )
 }
 

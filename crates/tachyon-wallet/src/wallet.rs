@@ -5,9 +5,11 @@ use crate::{
     control::{self, Control},
     funding_balance::{AddressUtxos, COINBASE_MATURITY},
     note::{self, Locator, Receipt},
+    payment::{self, NotePlaintext, PaymentAddress},
+    pir::PirClient,
     proofs::Prover,
     rpc::{Oss, Rpc},
-    store::{ChainData, Config, Pending, Store, StoredOperation, write_private},
+    store::{ChainData, Config, PaymentChannel, Pending, Store, StoredOperation, write_private},
     transaction::{self, FEE, Funding, Payment},
 };
 use anyhow::{Context, Result, ensure};
@@ -75,7 +77,27 @@ enum Operation {
         /// Replay from NuTachyon activation instead of trusting a recent epoch checkpoint.
         #[arg(long)]
         sync_from_activation: bool,
+        /// Optional Tachyon PIR query-server origin for private discovery and address resolution.
+        #[arg(long)]
+        pir_url: Option<String>,
+        /// Optional Registry write-API origin (defaults to --pir-url if omitted).
+        #[arg(long)]
+        registry_write_url: Option<String>,
+        /// Optional custom CA PEM file for the PIR server / Registry write API.
+        #[arg(long)]
+        pir_ca_file: Option<PathBuf>,
     },
+    /// Register this wallet's (pk, ek) address in the PIR Registry via proof-of-work.
+    Register {
+        /// Override the Registry write-API origin (defaults to configured registry_write_url or pir_url).
+        #[arg(long)]
+        registry_write_url: Option<String>,
+        /// Rotate to a fresh ML-KEM-768 ek index (increments ek_index; sync continues polling all 0..=ek_index).
+        #[arg(long)]
+        new_ek: bool,
+    },
+    /// List established inbound and outbound payment channels (channel keys are not printed).
+    Channels,
     /// Print Tachyon payment and transparent funding addresses.
     Address,
     /// Show Tachyon notes and confirmed transparent funding from the last successful sync, offline.
@@ -124,6 +146,9 @@ enum Operation {
         to: String,
         #[arg(long)]
         amount_zat: u64,
+        /// Optional short UTF-8 memo (up to 37 bytes) encrypted inside the on-chain TPM1 envelope.
+        #[arg(long)]
+        memo: Option<String>,
     },
     /// Spend one Tachyon note to a transparent testnet address, with Tachyon change.
     Unshield {
@@ -237,6 +262,9 @@ impl Command {
             accept_mock_proofs,
             birthday_height,
             sync_from_activation,
+            pir_url,
+            registry_write_url,
+            pir_ca_file,
         } = self.command
         {
             ensure!(
@@ -283,6 +311,12 @@ impl Command {
                 network_id: hex::encode(identity),
                 seed: note::random_seed(),
                 birthday_height: Some(birthday_height),
+                pir_url,
+                registry_write_url,
+                pir_ca_file,
+                ek_index: Some(0),
+                registry_chunk_id: None,
+                registry_digest: None,
             };
             // Finish this short initialization transaction once started, rather
             // than leaving a newly-created wallet without its configuration.
@@ -332,7 +366,7 @@ impl Command {
         } else {
             Store::open(&self.wallet_dir, false)?
         };
-        let config = store.config()?;
+        let mut config = store.config()?;
         let key = SpendingKey::from(config.seed);
         let oss = self
             .oss_url
@@ -346,6 +380,56 @@ impl Command {
         let result = match self.command {
             Operation::Init { .. } | Operation::Prune { .. } | Operation::Compact { .. } => {
                 unreachable!("handled above")
+            }
+            Operation::Register {
+                registry_write_url,
+                new_ek,
+            } => {
+                let write_url = registry_write_url
+                    .or_else(|| config.registry_write_url.clone())
+                    .or_else(|| config.pir_url.clone())
+                    .context("register requires --registry-write-url, or a wallet initialized with --registry-write-url / --pir-url")?;
+                let pir_origin = config.pir_url.as_deref().unwrap_or(&write_url);
+                let pir = PirClient::new(pir_origin, config.pir_ca_file.as_deref(), control)?;
+                let current_ek = config.ek_index.unwrap_or(0);
+                let ek_index = if new_ek {
+                    current_ek.checked_add(1).context("ek_index overflow")?
+                } else {
+                    current_ek
+                };
+                let addr = payment::own_registry_address(config.seed, ek_index);
+                let reg = pir.register_address(&write_url, &addr)?;
+                config.registry_chunk_id = Some(reg.chunk_id);
+                config.registry_digest = Some(reg.digest.hex());
+                config.ek_index = Some(ek_index);
+                store.set_config(&config)?;
+                let short_address = payment::format_pir_short_address(reg.chunk_id, &reg.digest.0);
+                json!({
+                    "payment_address": short_address,
+                    "chunk_id": reg.chunk_id,
+                    "digest": reg.digest.hex(),
+                    "created": reg.created,
+                    "visible_after_sequence": reg.visible_after_sequence,
+                    "ek_index": ek_index,
+                })
+            }
+            Operation::Channels => {
+                let channels: Vec<Value> = store
+                    .channels()?
+                    .into_iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "direction": c.direction,
+                            "peer_digest": c.peer_digest,
+                            "peer_pk": c.peer_pk,
+                            "next_tag_index": c.next_tag_index,
+                            "ek_index": c.ek_index,
+                            "created_scope": c.created_scope,
+                        })
+                    })
+                    .collect();
+                json!({ "channels": channels })
             }
             Operation::Address => addresses(&config)?,
             operation @ (Operation::Balance | Operation::BalanceSummary) => {
@@ -629,10 +713,26 @@ fn rpc(config: &Config, control: &Control) -> Result<Rpc> {
     Rpc::new(&config.rpc_url, config.cookie_file.clone(), control)
 }
 fn addresses(config: &Config) -> Result<Value> {
-    Ok(
-        json!({"network_id":config.network_id,"birthday_height":config.birthday_height.unwrap_or(config.activation),"tachyon_address":note::address(&SpendingKey::from(config.seed)),
-        "funding_address":transaction::funding_address(config.seed)?,"warning":"mock proofs; unencrypted keys; test funds only"}),
-    )
+    let ek_index = config.ek_index.unwrap_or(0);
+    let reg_addr = payment::own_registry_address(config.seed, ek_index);
+    let payment_address = match (config.registry_chunk_id, &config.registry_digest) {
+        (Some(chunk_id), Some(digest_hex)) => Some(payment::format_pir_short_address(
+            chunk_id,
+            &bytes32(digest_hex)?,
+        )),
+        _ => None,
+    };
+    Ok(json!({
+        "network_id": config.network_id,
+        "birthday_height": config.birthday_height.unwrap_or(config.activation),
+        "payment_address": payment_address,
+        "tachyon_full_address": payment::format_full_address(&reg_addr),
+        "tachyon_address": note::address(&SpendingKey::from(config.seed)),
+        "funding_address": transaction::funding_address(config.seed)?,
+        "ek_index": ek_index,
+        "pir_url": config.pir_url,
+        "warning": "mock proofs; unencrypted keys; test funds only"
+    }))
 }
 
 fn pending_status(pending: &Pending, store: &Store) -> Result<&'static str> {
@@ -914,9 +1014,20 @@ fn payment_request(operation: &Operation) -> Result<Value> {
             );
             json!({"kind":"consolidate","max_inputs":max_inputs})
         }
-        Operation::Send { to, amount_zat } => {
-            note::decode_address(to)?;
-            json!({"kind":"send","to":to,"amount_zat":amount_zat})
+        Operation::Send {
+            to,
+            amount_zat,
+            memo,
+        } => {
+            payment::parse_payment_address(to)?;
+            if let Some(text) = memo {
+                ensure!(
+                    text.len() <= payment::MAX_TEXT_MEMO_BYTES,
+                    "memo text exceeds {} UTF-8 bytes",
+                    payment::MAX_TEXT_MEMO_BYTES
+                );
+            }
+            json!({"kind":"send","to":to,"amount_zat":amount_zat,"memo":memo})
         }
         Operation::Unshield { to, amount_zat } | Operation::TransparentSend { to, amount_zat } => {
             transaction::transparent_script(to)?;
@@ -1011,6 +1122,9 @@ fn pay(
     let mut funding = None;
     let mut transparent_output = None;
     let mut recipient = None;
+    let mut memo_payload = Vec::new();
+    let mut outbound_channel_update: Option<PaymentChannel> = None;
+    let mut payment_mode: Option<&'static str> = None;
     let source;
     let rpc = rpc(config, control)?;
     match operation {
@@ -1095,7 +1209,11 @@ fn pay(
             outputs.push(Receipt::new(&config.network_id, &own_address, amount)?);
             spends = load_validated_notes(store, config, &ids, control)?;
         }
-        Operation::Send { to, amount_zat } | Operation::Unshield { to, amount_zat } => {
+        Operation::Send {
+            to,
+            amount_zat,
+            memo,
+        } => {
             ensure!(amount_zat > 0, "amount must be positive");
             let needed = amount_zat.checked_add(FEE).context("amount overflow")?;
             let mut available = available_note_summaries(store, config, control, true)?;
@@ -1123,15 +1241,151 @@ fn pay(
             } else {
                 format!("notes:{}", selected.join(","))
             };
-            // The command-specific address format was checked before accessing the node.
-            if to.starts_with("tachyon-test:") {
-                let receipt = Receipt::new(&config.network_id, &to, amount_zat)?;
-                outputs.push(receipt.clone());
-                recipient = Some(receipt);
-            } else {
-                transaction::transparent_script(&to)?;
-                transparent_output = Some((to, amount_zat));
+            match payment::parse_payment_address(&to)? {
+                PaymentAddress::LegacyPk(pk_hex) => {
+                    ensure!(
+                        memo.is_none(),
+                        "--memo requires a tachyon-pir: or tachyon-full: recipient address"
+                    );
+                    let receipt = Receipt::new(
+                        &config.network_id,
+                        &format!("tachyon-test:{pk_hex}"),
+                        amount_zat,
+                    )?;
+                    outputs.push(receipt.clone());
+                    recipient = Some(receipt);
+                    payment_mode = Some("legacy-receipt");
+                }
+                PaymentAddress::PirShort { chunk_id, digest } => {
+                    let digest_hex = hex::encode(digest);
+                    let (peer_pk_bytes, resolved_addr) =
+                        if let Some(existing) = store.outbound_channel_for_peer(&digest_hex)? {
+                            let pk_hex = existing
+                                .peer_pk
+                                .as_deref()
+                                .context("outbound channel missing peer_pk")?;
+                            (bytes32(pk_hex)?, None)
+                        } else {
+                            let pir_url = config.pir_url.as_deref().context(
+                                "sending to a tachyon-pir: address requires a wallet initialized with --pir-url",
+                            )?;
+                            let pir =
+                                PirClient::new(pir_url, config.pir_ca_file.as_deref(), control)?;
+                            let addr = pir.resolve_address(chunk_id, &digest)?;
+                            (addr.pk, Some(addr))
+                        };
+                    let receipt = Receipt::new(
+                        &config.network_id,
+                        &format!("tachyon-test:{}", hex::encode(peer_pk_bytes)),
+                        amount_zat,
+                    )?;
+                    let plaintext = NotePlaintext::from_receipt(&receipt, memo.as_deref())?;
+                    if let Some(mut existing) = store.outbound_channel_for_peer(&digest_hex)? {
+                        let k = bytes32(&existing.key_hex)?;
+                        let entry = payment::build_follow_up(
+                            &peer_pk_bytes,
+                            &k,
+                            existing.next_tag_index,
+                            &plaintext,
+                        )?;
+                        memo_payload = payment::encode_envelope(vec![entry])?;
+                        existing.next_tag_index = existing.next_tag_index.saturating_add(1);
+                        outbound_channel_update = Some(existing);
+                        payment_mode = Some("follow-up");
+                    } else {
+                        let addr = resolved_addr.expect("resolved above");
+                        let (entry, channel_key) = payment::build_first_contact(&addr, &plaintext)?;
+                        memo_payload = payment::encode_envelope(vec![entry])?;
+                        outbound_channel_update = Some(PaymentChannel {
+                            id: crate::pir::channel_id_for("outbound", &channel_key),
+                            direction: "outbound".into(),
+                            peer_digest: Some(digest_hex),
+                            peer_pk: Some(hex::encode(addr.pk)),
+                            key_hex: hex::encode(channel_key),
+                            next_tag_index: 0,
+                            ek_index: None,
+                            created_scope: None,
+                        });
+                        payment_mode = Some("first-contact");
+                    }
+                    outputs.push(receipt.clone());
+                    recipient = Some(receipt);
+                }
+                PaymentAddress::Full(addr) => {
+                    let digest_hex = hex::encode(addr.digest());
+                    let receipt = Receipt::new(
+                        &config.network_id,
+                        &format!("tachyon-test:{}", hex::encode(addr.pk)),
+                        amount_zat,
+                    )?;
+                    let plaintext = NotePlaintext::from_receipt(&receipt, memo.as_deref())?;
+                    if let Some(mut existing) = store.outbound_channel_for_peer(&digest_hex)? {
+                        let k = bytes32(&existing.key_hex)?;
+                        let entry = payment::build_follow_up(
+                            &addr.pk,
+                            &k,
+                            existing.next_tag_index,
+                            &plaintext,
+                        )?;
+                        memo_payload = payment::encode_envelope(vec![entry])?;
+                        existing.next_tag_index = existing.next_tag_index.saturating_add(1);
+                        outbound_channel_update = Some(existing);
+                        payment_mode = Some("follow-up");
+                    } else {
+                        let (entry, channel_key) = payment::build_first_contact(&addr, &plaintext)?;
+                        memo_payload = payment::encode_envelope(vec![entry])?;
+                        outbound_channel_update = Some(PaymentChannel {
+                            id: crate::pir::channel_id_for("outbound", &channel_key),
+                            direction: "outbound".into(),
+                            peer_digest: Some(digest_hex),
+                            peer_pk: Some(hex::encode(addr.pk)),
+                            key_hex: hex::encode(channel_key),
+                            next_tag_index: 0,
+                            ek_index: None,
+                            created_scope: None,
+                        });
+                        payment_mode = Some("first-contact");
+                    }
+                    outputs.push(receipt.clone());
+                    recipient = Some(receipt);
+                }
             }
+            let change = total - needed;
+            if change > 0 {
+                outputs.push(Receipt::new(&config.network_id, &own_address, change)?);
+            }
+            spends = load_validated_notes(store, config, &selected, control)?;
+        }
+        Operation::Unshield { to, amount_zat } => {
+            ensure!(amount_zat > 0, "amount must be positive");
+            let needed = amount_zat.checked_add(FEE).context("amount overflow")?;
+            let mut available = available_note_summaries(store, config, control, true)?;
+            available.sort_by_key(|(_, value)| *value);
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+            if let Some((id, value)) = available.iter().find(|(_, value)| *value >= needed) {
+                total = *value;
+                selected.push(id.clone());
+            } else {
+                for (id, value) in available.into_iter().take(64) {
+                    total = total.checked_add(value).context("note total overflow")?;
+                    selected.push(id);
+                    if total >= needed {
+                        break;
+                    }
+                }
+            }
+            ensure!(
+                total >= needed,
+                "available notes do not cover amount plus fee"
+            );
+            source = if selected.len() == 1 {
+                format!("note:{}", selected[0])
+            } else {
+                format!("notes:{}", selected.join(","))
+            };
+            transaction::transparent_script(&to)?;
+            transparent_output = Some((to, amount_zat));
             let change = total - needed;
             if change > 0 {
                 outputs.push(Receipt::new(&config.network_id, &own_address, change)?);
@@ -1163,6 +1417,7 @@ fn pay(
                 spends: spends.iter().collect(),
                 funding,
                 outputs: &outputs,
+                memo: memo_payload,
                 transparent_output,
                 expiry,
             },
@@ -1199,6 +1454,9 @@ fn pay(
         receipt: recipient,
     };
     store.reserve(&pending)?;
+    if let Some(channel) = outbound_channel_update {
+        store.put_channel(&channel)?;
+    }
     if let Some(id) = operation_id {
         store.put_operation(&StoredOperation {
             id: id.into(),
@@ -1213,7 +1471,7 @@ fn pay(
         format!("transaction {txid} saved; use transactions/submit/export-receipt to recover")
     })?;
     Ok(
-        json!({"txid":txid,"operation_id":operation_id,"reused":false,"status":"submitted","fee_zat":FEE,"expiry_height":expiry,"has_receipt":pending.receipt.is_some()}),
+        json!({"txid":txid,"operation_id":operation_id,"reused":false,"status":"submitted","fee_zat":FEE,"expiry_height":expiry,"has_receipt":pending.receipt.is_some(),"payment_mode":payment_mode}),
     )
 }
 

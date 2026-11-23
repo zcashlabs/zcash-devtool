@@ -7,6 +7,8 @@ mod chain;
 mod control;
 mod funding_balance;
 mod note;
+mod payment;
+mod pir;
 mod proofs;
 mod rpc;
 mod store;

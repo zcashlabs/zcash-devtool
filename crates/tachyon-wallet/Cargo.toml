@@ -9,11 +9,14 @@ publish = false
 [dependencies]
 anyhow = "1"
 bs58 = { version = "0.5", features = ["check"] }
+chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 ff = "0.14"
 hex = "0.4"
+ml-kem = { version = "0.2", features = ["deterministic"] }
 pasta_curves = { package = "zakura-pasta-curves", version = "1.0.1" }
 rand = { version = "0.10", features = ["std_rng"] }
+rand_08 = { package = "rand", version = "0.8" }
 udon = { package = "zakura-udon", version = "0.1.0", features = ["traits"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 tokio = { version = "1", features = ["rt", "macros", "signal", "sync", "time"] }
@@ -26,6 +29,8 @@ zstd = "0.13"
 sha2 = "0.10"
 ripemd = "0.1"
 zcash_script = "0.4.3"
+tachyon-pir-protocol = { git = "https://github.com/zcashlabs/tachyon-payments", rev = "c97b00fe24250e926d3a5e61e3ce6c4d488ac15b" }
+tachyon-pir-cli = { git = "https://github.com/zcashlabs/tachyon-payments", rev = "c97b00fe24250e926d3a5e61e3ce6c4d488ac15b" }
 # TEMPORARY: tachyon fork pinned to upstream ragu main, including the proof
 # wire decoder used by cached epoch and spendability proofs.
 zcash_tachyon = { git = "https://github.com/cnode-agent/tachyon", rev = "088f4e1df789fc507742a9a08d27a07604c6a247" }

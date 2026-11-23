@@ -80,6 +80,64 @@ pub struct Config {
     /// Missing on existing wallets, which retain their activation-based history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub birthday_height: Option<u32>,
+    /// Optional PIR query-server origin (e.g. `https://pir.tachyon.fastz.cash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pir_url: Option<String>,
+    /// Optional Registry write-API origin (defaults to `pir_url` when omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_write_url: Option<String>,
+    /// Optional custom CA PEM file for the PIR server / Registry write API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pir_ca_file: Option<PathBuf>,
+    /// Highest active ML-KEM-768 key derivation index (defaults to 0; sync polls 0..=ek_index).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ek_index: Option<u32>,
+    /// Assigned chunk_id from Registry registration, once registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_chunk_id: Option<u64>,
+    /// Hex-encoded 32-byte Registry address digest, once registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PaymentChannel {
+    pub id: String,
+    pub direction: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_pk: Option<String>,
+    pub key_hex: String,
+    pub next_tag_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ek_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_scope: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PirCursors {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_contact_sealed_scope: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo_sealed_scope: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tachygram_sealed_scope: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NotePirStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mined_epoch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mined_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp_ordinal: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent_epoch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_through_sealed_epoch: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -421,8 +479,113 @@ impl Store {
     }
     pub fn set_config(&self, config: &Config) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO config VALUES(1, ?)",
+            "INSERT INTO config VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
             [serde_json::to_string(config)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn put_note_if_new(&self, receipt: &Receipt) -> Result<bool> {
+        let existing: Option<Vec<u8>> = self
+            .conn
+            .query_row("SELECT data FROM notes WHERE id=?", [receipt.id()?], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let is_new = existing.is_none();
+        self.put_note(receipt)?;
+        Ok(is_new)
+    }
+
+    pub fn channels(&self) -> Result<Vec<PaymentChannel>> {
+        if !self.table_exists("channels")? {
+            return Ok(Vec::new());
+        }
+        self.read_all("SELECT data FROM channels ORDER BY id")
+    }
+
+    pub fn channel(&self, id: &str) -> Result<Option<PaymentChannel>> {
+        if !self.table_exists("channels")? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row("SELECT data FROM channels WHERE id=?", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(|data| Ok(serde_json::from_str(&data)?))
+            .transpose()
+    }
+
+    pub fn outbound_channel_for_peer(&self, peer_digest: &str) -> Result<Option<PaymentChannel>> {
+        Ok(self
+            .channels()?
+            .into_iter()
+            .find(|c| c.direction == "outbound" && c.peer_digest.as_deref() == Some(peer_digest)))
+    }
+
+    pub fn put_channel(&self, channel: &PaymentChannel) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        )?;
+        self.conn.execute(
+            "INSERT INTO channels VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            params![channel.id, serde_json::to_string(channel)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn pir_cursors(&self) -> Result<PirCursors> {
+        if !self.table_exists("pir_state")? {
+            return Ok(PirCursors::default());
+        }
+        let data: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM pir_state WHERE key='cursors'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match data {
+            Some(s) => Ok(serde_json::from_str(&s)?),
+            None => Ok(PirCursors::default()),
+        }
+    }
+
+    pub fn put_pir_cursors(&self, cursors: &PirCursors) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pir_state (key TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        )?;
+        self.conn.execute(
+            "INSERT INTO pir_state VALUES('cursors', ?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+            [serde_json::to_string(cursors)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn note_pir_status(&self, note_id: &str) -> Result<Option<NotePirStatus>> {
+        if !self.table_exists("note_pir_status")? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT data FROM note_pir_status WHERE id=?",
+                [note_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|data| Ok(serde_json::from_str(&data)?))
+            .transpose()
+    }
+
+    pub fn put_note_pir_status(&self, note_id: &str, status: &NotePirStatus) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS note_pir_status (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        )?;
+        self.conn.execute(
+            "INSERT INTO note_pir_status VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            params![note_id, serde_json::to_string(status)?],
         )?;
         Ok(())
     }

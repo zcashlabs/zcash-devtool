@@ -90,6 +90,8 @@ pub struct Payment<'a> {
     pub spends: Vec<&'a Receipt>,
     pub funding: Option<Funding>,
     pub outputs: &'a [Receipt],
+    /// Optional `vMemoTachyon` payload (e.g. a `TPM1` payment-protocol envelope).
+    pub memo: Vec<u8>,
     /// An unshielded payment, or transparent change from shielding a non-coinbase UTXO.
     pub transparent_output: Option<(String, u64)>,
     pub expiry: u32,
@@ -103,6 +105,7 @@ pub fn build(payment: Payment<'_>, prover: &Prover<'_>, control: &Control) -> Re
         spends,
         funding,
         outputs,
+        memo,
         transparent_output,
         expiry,
     } = payment;
@@ -179,7 +182,11 @@ pub fn build(payment: Payment<'_>, prover: &Prover<'_>, control: &Control) -> Re
         psi: nullifier::Trapdoor::random(&mut rng),
         rcm: CommitmentTrapdoor::random(&mut rng),
     };
-    let plan = Plan::new(spends, outputs, max_fee_note);
+    let plan = if memo.is_empty() {
+        Plan::new(spends, outputs, max_fee_note)
+    } else {
+        Plan::new(spends, outputs, max_fee_note).with_memo(memo)
+    };
     control.stage("Proving transaction stamp…")?;
     let stamp = plan
         .clone()
